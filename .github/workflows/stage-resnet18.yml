@@ -1,0 +1,29 @@
+name: Stage ResNet18 checkpoint
+
+on:
+  push:
+    paths:
+      - '.github/workflows/stage-resnet18.yml'
+  workflow_dispatch:
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official TorchVision ResNet18 ImageNet weights
+        run: |
+          python - <<'PY'
+          import hashlib, urllib.request
+          url = 'https://download.pytorch.org/models/resnet18-f37072fd.pth'
+          out = 'resnet18-f37072fd.pth'
+          urllib.request.urlretrieve(url, out)
+          h = hashlib.sha256(open(out,'rb').read()).hexdigest()
+          print('sha256', h)
+          assert h == 'f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec'
+          PY
+      - name: Upload checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: torchvision-resnet18-imagenet1k-v1
+          path: resnet18-f37072fd.pth
+          retention-days: 1
