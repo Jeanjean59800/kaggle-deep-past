@@ -1,0 +1,32 @@
+name: Stage official TorchVision backbones
+
+on:
+  push:
+    paths:
+      - '.github/workflows/stage-vision-backbones.yml'
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official TorchVision ImageNet weights
+        run: |
+          python - <<'PY'
+          import urllib.request
+          urls = [
+            'https://download.pytorch.org/models/efficientnet_b0_rwightman-7f5810bc.pth',
+            'https://download.pytorch.org/models/mobilenet_v3_large-5c1a4163.pth',
+            'https://download.pytorch.org/models/resnet50-11ad3fa6.pth',
+            'https://download.pytorch.org/models/convnext_tiny-983f1562.pth',
+          ]
+          for u in urls:
+              name = u.rsplit('/',1)[-1]
+              print('downloading', name)
+              urllib.request.urlretrieve(u, name)
+          PY
+      - name: Upload checkpoints
+        uses: actions/upload-artifact@v4
+        with:
+          name: torchvision-imagenet-backbones
+          path: '*.pth'
+          retention-days: 1
