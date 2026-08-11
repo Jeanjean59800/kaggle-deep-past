@@ -1,0 +1,29 @@
+name: Stage official DINOv2 ViT-S/14
+
+on:
+  push:
+    paths:
+      - '.github/workflows/stage-dinov2-vits14.yml'
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official DINOv2 source and weights
+        run: |
+          git clone --depth 1 https://github.com/facebookresearch/dinov2.git
+          python - <<'PY'
+          import urllib.request, hashlib
+          url='https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth'
+          out='dinov2_vits14_pretrain.pth'
+          urllib.request.urlretrieve(url,out)
+          print('sha256',hashlib.sha256(open(out,'rb').read()).hexdigest())
+          PY
+          rm -rf dinov2/.git dinov2/notebooks dinov2/docs dinov2/scripts
+          zip -qr dinov2_vits14_bundle.zip dinov2 dinov2_vits14_pretrain.pth
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dinov2-vits14-official-bundle
+          path: dinov2_vits14_bundle.zip
+          retention-days: 1
