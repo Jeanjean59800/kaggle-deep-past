@@ -1,0 +1,40 @@
+name: Kaggriculture isolated benchmark
+
+on:
+  push:
+    branches:
+      - scratch/kaggriculture-eval-20260815
+    paths:
+      - '.tmp_kaggriculture/**'
+      - '.github/workflows/kaggriculture-eval.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install pinned environment and statistics dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy
+          python -m pip install 'git+https://github.com/Kaggle/kaggle-environments.git@2f22627ff7def9fc23d57bebcab184476153c678'
+      - name: Run benchmark
+        env:
+          PYTHONHASHSEED: '0'
+        run: python .tmp_kaggriculture/benchmark.py --mode smoke
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggriculture-smoke-${{ github.run_id }}
+          path: .tmp_kaggriculture/out
+          if-no-files-found: warn
+          retention-days: 2
