@@ -1,0 +1,267 @@
+
+# ============================================================================
+# E300 V2 — centralized closed-loop controller for Kaggriculture 1.32.7
+# ============================================================================
+# The embedded low/high farm routes remain the production backbone.  This layer
+# centralizes state reconciliation, market planning, resource safety, adaptive
+# sales, rolling shop demand, sparse sidecars, worker recovery, and endgame.
+
+from collections import Counter, deque
+
+__version__ = "E300-V2-closed-loop-1.32.7"
+
+_V2_ENABLE_TASK_CONTROLLER = True
+_V2_ENABLE_ADAPTIVE_SALES = True
+_V2_ENABLE_SIDECARS = True
+_V2_ENABLE_DYNAMIC_ANIMALS = True
+_V2_ENABLE_CASH_GUARD = True
+_V2_ENABLE_SEED_CAP = True
+_V2_ENABLE_TERMINAL = True
+_V2_ALLOW_NONCRITICAL_OVERRIDE = True
+
+_V2_END_STEP = 719
+_V2_LAST_DAY = 29
+_V2_HINGE_GAIN = 8.0
+_V2_PRODUCTS = (
+    "WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON",
+    "EGG", "MILK", "WOOL", "FERTILIZER",
+)
+_V2_CROPS = {
+    "WHEAT":      {"seed": 10,  "first": 2,  "max_day": 4,  "interval": 0, "max_yield": 6, "ongoing": False, "latest": 27},
+    "CARROT":     {"seed": 20,  "first": 2,  "max_day": 3,  "interval": 0, "max_yield": 4, "ongoing": False, "latest": 26},
+    "TOMATO":     {"seed": 50,  "first": 8,  "max_day": 8,  "interval": 1, "max_yield": 4, "ongoing": True,  "latest": 20},
+    "STRAWBERRY": {"seed": 100, "first": 10, "max_day": 10, "interval": 2, "max_yield": 4, "ongoing": True,  "latest": 18},
+    "MELON":      {"seed": 80,  "first": 10, "max_day": 12, "interval": 0, "max_yield": 6, "ongoing": False, "latest": 17},
+}
+_V2_ANIMALS = {
+    "GOOSE": {"cost": 300, "structure": "COOP", "first": 4, "interval": 1, "product": "EGG"},
+    "COW":   {"cost": 400, "structure": "PASTURE", "first": 8, "interval": 2, "product": "MILK"},
+    "SHEEP": {"cost": 500, "structure": "PASTURE", "first": 6, "interval": 3, "product": "WOOL"},
+}
+_V2_SHOPS = {
+    "BAKERY": ("EGG", "WHEAT"),
+    "PIZZA_SHOP": ("MILK", "TOMATO", "WHEAT"),
+    "BRUNCH_SPOT": ("EGG", "WHEAT", "STRAWBERRY"),
+    "YARN_STORE": ("WOOL",),
+    "ICE_CREAM_SHOP": ("STRAWBERRY", "MILK", "WHEAT"),
+    "PET_CAFE": ("CARROT",),
+    "SMOOTHIE_SHOP": ("STRAWBERRY", "MILK"),
+    "FARMERS_MARKET": ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY"),
+}
+
+# Current official 1.32.7 price curves.  Replace the stale tuples used by the
+# parent agent so all inherited impact ranking/counters use the same engine.
+_MARKET_PARAMS = {
+    "WHEAT":      (25, 10000, 400, "sqrt",   0.80, "log",    0.20),
+    "CARROT":     (35, 10000, 450, "hinge",  1.00, "sqrt",   0.70),
+    "TOMATO":     (60, 10000, 200, "hinge",  0.40, "sqrt",   0.60),
+    "STRAWBERRY": (120,10000, 100, "sqrt",   0.70, "linear", 1.60),
+    "MELON":      (250,10000, 300, "log",    0.20, "sq",     3.60),
+    "EGG":        (50, 10000, 332, "hinge",  0.40, "log",    0.20),
+    "MILK":       (160,10000, 122, "sqrt",   0.60, "linear", 1.60),
+    "WOOL":       (200,10000, 105, "log",    0.20, "sq",     3.20),
+    "FERTILIZER": (100,10000, 200, "linear", 0.40, "linear", 0.40),
+}
+
+
+def _shape(name, value, scale=None):
+    value = max(0.0, float(value))
+    if name == "linear":
+        return value
+    if name == "sq":
+        return value * value
+    if name == "sqrt":
+        return math.sqrt(value)
+    if name == "log":
+        return math.log1p(value)
+    if name == "log10":
+        return math.log10(1.0 + value)
+    if name == "hinge":
+        scale = max(1e-9, float(scale or 1.0))
+        u = value / scale
+        return u + _V2_HINGE_GAIN * max(0.0, u - 1.0) ** 2
+    raise ValueError(name)
+
+
+def _market_price(item, inventory):
+    base, equilibrium, scale, below_func, below_target, above_func, above_target = _MARKET_PARAMS[item]
+    if inventory < equilibrium:
+        amplitude = below_target * base / _shape(below_func, scale, scale)
+        price = base + amplitude * _shape(below_func, equilibrium - inventory, scale)
+    else:
+        amplitude = above_target * base / _shape(above_func, scale, scale)
+        price = base - amplitude * _shape(above_func, inventory - equilibrium, scale)
+    return max(_PRICE_FLOOR, int(round(price)))
+
+
+def _v2_plan_stats(actions):
+    crops = tuple(_V2_CROPS)
+    animals = tuple(_V2_ANIMALS)
+    cumulative_plants = [{crop: 0 for crop in crops}]
+    cumulative_animals = [{animal: 0 for animal in animals}]
+    cumulative_hires = [0]
+    for action in actions:
+        p = dict(cumulative_plants[-1])
+        a = dict(cumulative_animals[-1])
+        h = cumulative_hires[-1]
+        for unit in [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]:
+            if isinstance(unit, (list, tuple)) and len(unit) >= 2 and unit[0] == "PLANT" and unit[1] in p:
+                p[unit[1]] += 1
+        for order in action.get("market", []) or []:
+            if not isinstance(order, (list, tuple)) or not order:
+                continue
+            if order[0] == "BUY_ANIMAL" and len(order) >= 3 and order[1] in a:
+                a[order[1]] += max(0, int(order[2] or 0))
+            elif order[0] == "HIRE":
+                h += 1
+        cumulative_plants.append(p)
+        cumulative_animals.append(a)
+        cumulative_hires.append(h)
+    final_plants = dict(cumulative_plants[-1])
+    final_animals = dict(cumulative_animals[-1])
+    suffix_plants = []
+    for step in range(len(actions) + 1):
+        suffix_plants.append({crop: final_plants[crop] - cumulative_plants[step][crop] for crop in crops})
+    return {
+        "cum_plants": cumulative_plants,
+        "cum_animals": cumulative_animals,
+        "cum_hires": cumulative_hires,
+        "suffix_plants": suffix_plants,
+        "final_plants": final_plants,
+        "final_animals": final_animals,
+    }
+
+
+_V2_ROUTE_ACTIONS = {"low": _E279_LOW_ACTIONS, "high": _E279_HIGH_ACTIONS}
+_V2_PLAN = {name: _v2_plan_stats(actions) for name, actions in _V2_ROUTE_ACTIONS.items()}
+_V2_BASE_AGENT = _E279_PUBLIC_AGENT
+
+
+def _v2_new_state():
+    return {
+        "last_step": -1,
+        "route": None,
+        "previous_tiles": None,
+        "actual_plants": {crop: 0 for crop in _V2_CROPS},
+        "actual_animals": {animal: 0 for animal in _V2_ANIMALS},
+        "sidecar_targets": {"CARROT": 0, "TOMATO": 0, "STRAWBERRY": 0, "GOOSE": 0, "SHEEP": 0},
+        "pending_sells": {item: 0 for item in _V2_PRODUCTS},
+        "price_history": {item: deque(maxlen=96) for item in _V2_PRODUCTS},
+        "last_action": None,
+        "last_money": None,
+        "last_hands": None,
+        "failures": Counter(),
+    }
+
+
+_V2_STATE = {0: _v2_new_state(), 1: _v2_new_state()}
+
+
+def _v2_step(obs):
+    explicit = _get(obs, "step")
+    if explicit is not None:
+        return max(0, int(explicit or 0))
+    return max(0, int(_get(obs, "day", 0) or 0) * 24 + int(_get(obs, "hour", 0) or 0))
+
+
+def _v2_snapshot(farm):
+    snapshot = []
+    for y, row in enumerate(_get(farm, "tiles", []) or []):
+        for x, tile in enumerate(row or []):
+            if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                snapshot.append((x, y, "PLANT", str(tile.get("crop")), int(tile.get("planted_day", -1))))
+            elif isinstance(tile, dict) and tile.get("animal"):
+                snapshot.append((x, y, "ANIMAL", str(tile.get("animal")), int(tile.get("placed_day", -1))))
+            elif isinstance(tile, dict):
+                snapshot.append((x, y, str(tile.get("kind", "")), "", -1))
+            elif tile == "LOCKED":
+                snapshot.append((x, y, "LOCKED", "", -1))
+            else:
+                snapshot.append((x, y, "EMPTY", "", -1))
+    return tuple(snapshot)
+
+
+def _v2_state(obs):
+    seat = _seat(obs)
+    step = _v2_step(obs)
+    state = _V2_STATE[seat]
+    if step == 0 or step < int(state.get("last_step", -1)):
+        state = _v2_new_state()
+        _V2_STATE[seat] = state
+    farm = _farm(obs, seat)
+    current = _v2_snapshot(farm)
+    previous = state.get("previous_tiles")
+    if previous is not None and len(previous) == len(current):
+        for old, new in zip(previous, current):
+            if new[2] == "PLANT" and old != new:
+                crop = new[3]
+                if crop in state["actual_plants"]:
+                    state["actual_plants"][crop] += 1
+            elif new[2] == "ANIMAL" and old != new:
+                animal = new[3]
+                if animal in state["actual_animals"]:
+                    state["actual_animals"][animal] += 1
+    state["previous_tiles"] = current
+    market = _get(obs, "market", {}) or {}
+    prices = _get(market, "prices", {}) or {}
+    for item in _V2_PRODUCTS:
+        try:
+            state["price_history"][item].append(max(1.0, float(_get(prices, item, 1) or 1)))
+        except (TypeError, ValueError):
+            pass
+    # Cheap reconciliation signals, used for diagnostics and safety escalation.
+    money = float(_get(farm, "money", 0) or 0)
+    hands = len(_get(farm, "hands", []) or [])
+    if state.get("last_action") is not None and state.get("last_hands") is not None:
+        expected_hires = sum(1 for order in (state["last_action"].get("market") or []) if order and order[0] == "HIRE")
+        if expected_hires and hands < int(state["last_hands"]) + expected_hires:
+            state["failures"]["HIRE"] += 1
+    state["last_money"] = money
+    state["last_hands"] = hands
+    state["last_step"] = step
+    return state
+
+
+def _v2_shop_counts(obs):
+    shops = list(_get(_get(obs, "town", {}) or {}, "unlocked_shops", []) or [])
+    return Counter(str(shop) for shop in shops)
+
+
+def _v2_route(obs, state):
+    step = _v2_step(obs)
+    if state.get("route") is None and step >= _E279_DECISION_STEP:
+        counts = _v2_shop_counts(obs)
+        # A single early Yarn Store did not justify the full high-capacity route
+        # in the replay set.  Reserve high for genuinely repeated early demand;
+        # later/single Yarn signals are handled by a sparse sheep sidecar.
+        state["route"] = "high" if counts.get("YARN_STORE", 0) >= 2 else "low"
+    return str(state.get("route") or "low")
+
+
+def _v2_farm_counts(farm):
+    counts = Counter()
+    structures = Counter()
+    weeds = 0
+    for row in _get(farm, "tiles", []) or []:
+        for tile in row or []:
+            if not isinstance(tile, dict):
+                continue
+            if tile.get("kind") == "PLANT":
+                counts[str(tile.get("crop"))] += 1
+            if tile.get("animal"):
+                counts[str(tile.get("animal"))] += 1
+            kind = str(tile.get("kind", ""))
+            if kind in ("PASTURE", "COOP"):
+                structures[kind] += 1
+                if not tile.get("animal"):
+                    structures[kind + "_EMPTY"] += 1
+            if kind == "WEED":
+                weeds += 1
+    counts["WEED"] = weeds
+    counts.update(structures)
+    return counts
+
+
+def _v2_private_totals(obs):
+    private = _get(obs, "private", {}) or {}
+    shed = Counter({str(k): max(0, int(v or 0)) for k, v in dict(_get(private, "shed", {}) or {}).items()})
