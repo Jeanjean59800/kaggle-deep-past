@@ -1,0 +1,99 @@
+    result = stats.bootstrap(
+        (values,),
+        np.mean,
+        confidence_level=0.95,
+        method="BCa",
+        n_resamples=20000,
+        random_state=np.random.default_rng(20260815),
+        vectorized=False,
+    )
+    return float(result.confidence_interval.low), float(result.confidence_interval.high)
+
+
+def summarize(rows: list[SeedResult]) -> dict[str, object]:
+    values = np.asarray([row.paired_margin for row in rows], dtype=float)
+    wins = int(np.sum(values > 0))
+    losses = int(np.sum(values < 0))
+    ties = int(np.sum(values == 0))
+    mean = float(np.mean(values))
+    median = float(np.median(values))
+    sd = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    ci_low, ci_high = bootstrap_mean_ci(values)
+    if len(values) > 1 and sd > 0:
+        ttest = stats.ttest_1samp(values, 0.0, alternative="greater")
+        t_stat = float(ttest.statistic)
+        t_p = float(ttest.pvalue)
+    else:
+        t_stat = float("nan")
+        t_p = float("nan")
+    nonzero = values[values != 0]
+    if len(nonzero) >= 2:
+        try:
+            wilcoxon = stats.wilcoxon(nonzero, alternative="greater", zero_method="wilcox")
+            w_stat = float(wilcoxon.statistic)
+            w_p = float(wilcoxon.pvalue)
+        except ValueError:
+            w_stat = w_p = float("nan")
+    else:
+        w_stat = w_p = float("nan")
+    sign_p = float(stats.binomtest(wins, wins + losses, p=0.5, alternative="greater").pvalue) if wins + losses else float("nan")
+    return {
+        "variant": rows[0].variant if rows else None,
+        "opponent": rows[0].opponent if rows else None,
+        "split": rows[0].split if rows else None,
+        "n_seed_blocks": len(rows),
+        "n_games": 2 * len(rows),
+        "wins": wins,
+        "ties": ties,
+        "losses": losses,
+        "win_rate": wins / max(1, wins + losses),
+        "mean_paired_margin": mean,
+        "median_paired_margin": median,
+        "sd_paired_margin": sd,
+        "bootstrap_bca_95_ci_low": ci_low,
+        "bootstrap_bca_95_ci_high": ci_high,
+        "paired_t_statistic": t_stat,
+        "paired_t_one_sided_p": t_p,
+        "wilcoxon_statistic": w_stat,
+        "wilcoxon_one_sided_p": w_p,
+        "exact_sign_one_sided_p": sign_p,
+        "cohen_dz": mean / sd if sd > 0 else (float("inf") if mean > 0 else 0.0),
+        "mean_challenger_reward": float(np.mean([(r.challenger_seat0 + r.challenger_seat1) / 2 for r in rows])),
+        "mean_opponent_reward": float(np.mean([(r.opponent_seat0 + r.opponent_seat1) / 2 for r in rows])),
+        "mean_elapsed_seconds_per_seed_block": float(np.mean([r.elapsed_seconds for r in rows])),
+        "significant_positive_at_5pct": bool(ci_low > 0 and math.isfinite(t_p) and t_p < 0.05),
+    }
+
+
+def write_rows(rows: list[SeedResult], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(asdict(rows[0]).keys()))
+        writer.writeheader()
+        writer.writerows(asdict(row) for row in rows)
+
+
+def rank_key(summary: dict[str, object]) -> tuple[float, float, float, float]:
+    return (
+        float(summary["bootstrap_bca_95_ci_low"]),
+        float(summary["mean_paired_margin"]),
+        -float(summary["losses"]),
+        -float(summary["sd_paired_margin"]),
+    )
+
+
+def deterministic_submission(main_path: Path, archive_path: Path) -> str:
+    payload = main_path.read_bytes()
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        info = tarfile.TarInfo("main.py")
+        info.size = len(payload)
+        info.mtime = 0
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(payload))
+    with archive_path.open("wb") as handle:
