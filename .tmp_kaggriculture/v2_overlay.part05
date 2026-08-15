@@ -1,0 +1,28 @@
+
+# --- V2 reconciliation patch: exact seed cap and true missed-hire recovery ---
+def _v2_seed_need(obs, state, route, crop, step):
+    del obs, step
+    if crop not in _V2_CROPS:
+        return 0
+    desired_total = (
+        int(_V2_PLAN[route]["final_plants"].get(crop, 0))
+        + int(state["sidecar_targets"].get(crop, 0))
+    )
+    return max(0, desired_total - int(state["actual_plants"].get(crop, 0)))
+
+
+_V2_FILTER_AND_ADD_ORDERS_BASE = _v2_filter_and_add_orders
+
+
+def _v2_filter_and_add_orders(obs, action, state, route):
+    action = _V2_FILTER_AND_ADD_ORDERS_BASE(obs, action, state, route)
+    step = _v2_step(obs)
+    farm = _farm(obs, _seat(obs))
+    raw_route_action = _V2_ROUTE_ACTIONS[route][min(step, len(_V2_ROUTE_ACTIONS[route]) - 1)]
+    expected_hands = len(raw_route_action.get("hands") or [])
+    actual_hands = len(_get(farm, "hands", []) or [])
+    existing_hires = sum(1 for order in action.get("market", []) or [] if order and order[0] == "HIRE")
+    missing = max(0, expected_hands - actual_hands - existing_hires)
+    if missing and int(_get(obs, "hour", step % 24) or 0) <= 10:
+        action["market"] = list(action.get("market") or []) + [["HIRE"] for _ in range(min(2, missing))]
+    return action
