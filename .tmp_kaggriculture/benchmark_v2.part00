@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import base64
+import csv
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import math
+import os
+import shutil
+import statistics
+import sys
+import tarfile
+import time
+import urllib.request
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable, Iterable
+
+import numpy as np
+from scipy import stats
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / "out_v2"
+AGENTS = OUT / "agents"
+PARTS = [ROOT / f"v2_overlay.part{i:02d}" for i in range(5)]
+TARGET_NOTEBOOK_URL = (
+    "https://raw.githubusercontent.com/mohanprasath-dev/kaggriculture/"
+    "0047a7010be39d478e3c3348def2ebae584db736/kaggriculture-t.ipynb"
+)
+TARGET_SHA256 = "d39dba50793d9777c990347443bf0c481c78adaea86055f6f6b0600dcfcd9f2e"
+ENV_COMMIT = "28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c"
+PUBLIC_OPPONENTS = {
+    "mapleleaf_42": (
+        "https://raw.githubusercontent.com/5thDimension-Sean/kaggriculture/"
+        "87976000a86ccc41841a59ee7c2a3524b87bd4d9/main.py"
+    ),
+    "public_v23": (
+        "https://raw.githubusercontent.com/Chirantan02/Kaggriculture/"
+        "16d2a2777cf2a7e5172e4f6d8272f6143a695243/main_v23.py"
+    ),
+}
+
+Agent = Callable[..., dict]
+
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    use_overlay: bool
+    replacements: tuple[tuple[str, str], ...] = ()
+    eligible: bool = True
+    description: str = ""
+
+
+@dataclass
+class SeedResult:
+    variant: str
+    opponent: str
+    split: str
+    seed: int
+    challenger_seat0: float
+    opponent_seat1: float
+    margin_seat0: float
+    opponent_seat0: float
+    challenger_seat1: float
+    margin_seat1: float
+    paired_margin: float
+    elapsed_seconds: float
+
+
+BASE_PREEMPTION = (
+    ("_PREEMPT_ENABLED = False", "_PREEMPT_ENABLED = True"),
+    ("_PREEMPT_FRACTION = 2.0", "_PREEMPT_FRACTION = 1.0"),
+)
+
+# Every V2 candidate builds on the previously locked and independently validated
+# preemption control.  The ablation separates route choice, adaptive selling,
+# sparse sidecars, and non-critical task overrides.
+VARIANTS = [
+    Variant(
+        "preemption_only",
+        False,
+        BASE_PREEMPTION,
+        False,
+        "Previously validated exact-target control; no V2 overlay.",
+    ),
+    Variant(
+        "v2_safety_original_route",
+        True,
+        BASE_PREEMPTION + (
+            ("_V2_ENABLE_ADAPTIVE_SALES = True", "_V2_ENABLE_ADAPTIVE_SALES = False"),
+            ("_V2_ENABLE_SIDECARS = True", "_V2_ENABLE_SIDECARS = False"),
+            ("_V2_ENABLE_DYNAMIC_ANIMALS = True", "_V2_ENABLE_DYNAMIC_ANIMALS = False"),
+            ("_V2_ALLOW_NONCRITICAL_OVERRIDE = True", "_V2_ALLOW_NONCRITICAL_OVERRIDE = False"),
+            (
+                'state["route"] = "high" if counts.get("YARN_STORE", 0) >= 2 else "low"',
+                'state["route"] = _e279_selected_expert(obs)',
+            ),
+        ),
+        True,
+        "Validation, cash reserve, seed cap, recovery tasks, terminal plan; original selector.",
+    ),
+    Variant(
+        "v2_market_original_route",
+        True,
+        BASE_PREEMPTION + (
+            ("_V2_ENABLE_SIDECARS = True", "_V2_ENABLE_SIDECARS = False"),
+            ("_V2_ENABLE_DYNAMIC_ANIMALS = True", "_V2_ENABLE_DYNAMIC_ANIMALS = False"),
+            ("_V2_ALLOW_NONCRITICAL_OVERRIDE = True", "_V2_ALLOW_NONCRITICAL_OVERRIDE = False"),
+            (
+                'state["route"] = "high" if counts.get("YARN_STORE", 0) >= 2 else "low"',
+                'state["route"] = _e279_selected_expert(obs)',
+            ),
+        ),
+        True,
+        "Safety layer plus adaptive premium sales; original selector.",
+    ),
+    Variant(
+        "v2_safety_threshold2",
+        True,
+        BASE_PREEMPTION + (
+            ("_V2_ENABLE_ADAPTIVE_SALES = True", "_V2_ENABLE_ADAPTIVE_SALES = False"),
+            ("_V2_ENABLE_SIDECARS = True", "_V2_ENABLE_SIDECARS = False"),
+            ("_V2_ENABLE_DYNAMIC_ANIMALS = True", "_V2_ENABLE_DYNAMIC_ANIMALS = False"),
+            ("_V2_ALLOW_NONCRITICAL_OVERRIDE = True", "_V2_ALLOW_NONCRITICAL_OVERRIDE = False"),
+        ),
+        True,
+        "Safety layer with repeated-Yarn threshold selector.",
+    ),
+    Variant(
+        "v2_market_threshold2",
+        True,
+        BASE_PREEMPTION + (
+            ("_V2_ENABLE_SIDECARS = True", "_V2_ENABLE_SIDECARS = False"),
+            ("_V2_ENABLE_DYNAMIC_ANIMALS = True", "_V2_ENABLE_DYNAMIC_ANIMALS = False"),
+            ("_V2_ALLOW_NONCRITICAL_OVERRIDE = True", "_V2_ALLOW_NONCRITICAL_OVERRIDE = False"),
+        ),
+        True,
+        "Safety plus adaptive sales and repeated-Yarn threshold selector.",
+    ),
+    Variant(
+        "v2_full_conservative",
+        True,
+        BASE_PREEMPTION + (
+            ("_V2_ALLOW_NONCRITICAL_OVERRIDE = True", "_V2_ALLOW_NONCRITICAL_OVERRIDE = False"),
+        ),
+        True,
+        "All V2 features; task controller only replaces PASS/invalid non-critical actions.",
+    ),
+    Variant(
+        "v2_full_aggressive",
+        True,
+        BASE_PREEMPTION,
+        True,
+        "All V2 features and priority-based replacement of non-critical route actions.",
+    ),
+]
+
+
+def download_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=90) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def download_text(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=90) as response:
+        return response.read().decode("utf-8")
+
+
+def exact_target_payload() -> bytes:
+    notebook = download_json(TARGET_NOTEBOOK_URL)
+    source = next(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+        and "AGENT_B64" in "".join(cell.get("source", []))
+    )
+    namespace: dict[str, object] = {}
+    exec(compile(source, "target_notebook_payload.py", "exec"), namespace)
+    payload = base64.b64decode(str(namespace["AGENT_B64"]))
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != TARGET_SHA256:
+        raise RuntimeError(f"Target SHA mismatch: expected {TARGET_SHA256}, got {digest}")
+    return payload
+
+
+def apply_replacements(text: str, replacements: Iterable[tuple[str, str]], label: str) -> str:
+    for old, new in replacements:
+        count = text.count(old)
+        if count != 1:
+            raise RuntimeError(
+                f"{label}: replacement {old!r} expected exactly once, found {count}"
+            )
+        text = text.replace(old, new, 1)
+    return text
+
+
+def build_agents(target_payload: bytes) -> dict[str, Path]:
+    AGENTS.mkdir(parents=True, exist_ok=True)
+    target_text = target_payload.decode("utf-8")
+    overlay = "".join(part.read_text(encoding="utf-8") for part in PARTS)
+    paths: dict[str, Path] = {}
+
+    target_path = AGENTS / "target_exact.py"
+    target_path.write_text(target_text + "\n# benchmark_role='target_exact'\n", encoding="utf-8")
+    compile(target_path.read_text(encoding="utf-8"), str(target_path), "exec")
+    paths["target_exact"] = target_path
+
+    for variant in VARIANTS:
+        text = target_text + (overlay if variant.use_overlay else "")
+        text = apply_replacements(text, variant.replacements, variant.name)
+        text += f"\n# benchmark_variant={variant.name!r}\n"
+        path = AGENTS / f"{variant.name}.py"
+        path.write_text(text, encoding="utf-8")
+        compile(text, str(path), "exec")
+        paths[variant.name] = path
+
+    public_dir = AGENTS / "public"
+    public_dir.mkdir(exist_ok=True)
+    for name, url in PUBLIC_OPPONENTS.items():
+        try:
+            text = download_text(url)
+            path = public_dir / f"{name}.py"
+            path.write_text(text, encoding="utf-8")
+            compile(text, str(path), "exec")
+            paths[name] = path
+        except Exception as exc:
+            print(f"WARNING: public opponent {name} unavailable: {exc}", flush=True)
+    return paths
+
+
+def load_agent(path: Path, label: str) -> Agent:
