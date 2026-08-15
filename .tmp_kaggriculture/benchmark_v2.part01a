@@ -1,0 +1,98 @@
+    unique = hashlib.sha1(f"{path}:{label}:{os.getpid()}:{time.time_ns()}".encode()).hexdigest()[:16]
+    module_name = f"kaggriculture_{unique}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot import {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    fn = getattr(module, "agent", None)
+    if not callable(fn):
+        raise RuntimeError(f"No callable agent in {path}")
+    return fn
+
+
+def run_game(agent0_path: Path, agent1_path: Path, seed: int, label: str) -> tuple[float, float]:
+    from kaggle_environments import make
+
+    agent0 = load_agent(agent0_path, label + "_0")
+    agent1 = load_agent(agent1_path, label + "_1")
+    env = make(
+        "kaggriculture",
+        configuration={"seed": int(seed), "actTimeout": 3, "runTimeout": 1200},
+        debug=False,
+    )
+    env.run([agent0, agent1])
+    rewards = [state.reward for state in env.state]
+    statuses = [str(state.status) for state in env.state]
+    if any(reward is None or not math.isfinite(float(reward)) for reward in rewards):
+        raise RuntimeError(f"Non-finite rewards seed={seed}: {rewards}, statuses={statuses}")
+    if any(status != "DONE" for status in statuses):
+        raise RuntimeError(f"Incomplete game seed={seed}: {rewards}, statuses={statuses}")
+    return float(rewards[0]), float(rewards[1])
+
+
+def paired_worker(task: tuple[str, str, str, str, str, int]) -> SeedResult:
+    variant, challenger_raw, opponent, opponent_raw, split, seed = task
+    challenger_path = Path(challenger_raw)
+    opponent_path = Path(opponent_raw)
+    started = time.perf_counter()
+    c0, o1 = run_game(challenger_path, opponent_path, seed, f"{variant}_{opponent}_{split}_{seed}_a")
+    o0, c1 = run_game(opponent_path, challenger_path, seed, f"{variant}_{opponent}_{split}_{seed}_b")
+    m0 = c0 - o1
+    m1 = c1 - o0
+    return SeedResult(
+        variant=variant,
+        opponent=opponent,
+        split=split,
+        seed=int(seed),
+        challenger_seat0=c0,
+        opponent_seat1=o1,
+        margin_seat0=m0,
+        opponent_seat0=o0,
+        challenger_seat1=c1,
+        margin_seat1=m1,
+        paired_margin=(m0 + m1) / 2.0,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def evaluate_parallel(
+    variant: str,
+    challenger_path: Path,
+    opponent: str,
+    opponent_path: Path,
+    split: str,
+    seeds: list[int],
+) -> list[SeedResult]:
+    workers = max(1, min(int(os.environ.get("BENCH_WORKERS", "4")), len(seeds)))
+    tasks = [
+        (variant, str(challenger_path), opponent, str(opponent_path), split, int(seed))
+        for seed in seeds
+    ]
+    rows: list[SeedResult] = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(paired_worker, task): task[-1] for task in tasks}
+        for done, future in enumerate(as_completed(futures), 1):
+            seed = futures[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                raise RuntimeError(f"{variant}/{opponent}/{split} failed on seed {seed}: {exc}") from exc
+            if done == 1 or done % 4 == 0 or done == len(tasks):
+                mean = statistics.fmean(row.paired_margin for row in rows)
+                wins = sum(row.paired_margin > 0 for row in rows)
+                losses = sum(row.paired_margin < 0 for row in rows)
+                print(
+                    f"[{split}] {variant} vs {opponent}: {done}/{len(tasks)} "
+                    f"mean={mean:.1f} W-L={wins}-{losses}",
+                    flush=True,
+                )
+    rows.sort(key=lambda row: row.seed)
+    return rows
+
+
+def bootstrap_mean_ci(values: np.ndarray) -> tuple[float, float]:
+    if len(values) < 2 or np.all(values == values[0]):
+        value = float(values[0]) if len(values) else float("nan")
+        return value, value
