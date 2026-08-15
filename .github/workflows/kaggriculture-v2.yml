@@ -35,6 +35,7 @@ jobs:
             .tmp_kaggriculture/benchmark_v2.part02a \
             .tmp_kaggriculture/benchmark_v2.part02b \
             > .tmp_kaggriculture/benchmark_v2.py
+          sed -i 's/range(5)/range(6)/' .tmp_kaggriculture/benchmark_v2.py
           python -m py_compile .tmp_kaggriculture/benchmark_v2.py
       - name: Run development, validation and locked holdout
         env:
