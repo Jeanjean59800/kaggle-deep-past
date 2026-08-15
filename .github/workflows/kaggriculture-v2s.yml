@@ -1,0 +1,48 @@
+name: Kaggriculture surgical V2 benchmark
+
+on:
+  push:
+    branches:
+      - scratch/kaggriculture-v2-20260815
+    paths:
+      - '.tmp_kaggriculture/v2s_overlay.py'
+      - '.tmp_kaggriculture/benchmark_v2s.py'
+      - '.github/workflows/kaggriculture-v2s.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact engine and statistics dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy
+          python -m pip install 'git+https://github.com/Kaggle/kaggle-environments.git@28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c'
+      - name: Compile benchmark and overlay
+        run: |
+          python -m py_compile .tmp_kaggriculture/v2s_overlay.py
+          python -m py_compile .tmp_kaggriculture/benchmark_v2s.py
+      - name: Run gated smoke, development, validation and holdout
+        env:
+          PYTHONHASHSEED: '0'
+          BENCH_WORKERS: '4'
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+        run: python .tmp_kaggriculture/benchmark_v2s.py
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggriculture-v2s-${{ github.run_id }}
+          path: .tmp_kaggriculture/out_v2s
+          if-no-files-found: warn
+          retention-days: 3
