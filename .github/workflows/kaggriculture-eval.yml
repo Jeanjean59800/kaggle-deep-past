@@ -1,9 +1,9 @@
-name: Kaggriculture E300 benchmark
+name: Kaggriculture adaptive-market v24
 
 on:
   push:
     branches:
-      - scratch/kaggriculture-e300-20260815
+      - scratch/kaggriculture-v24-20260815
     paths:
       - '.tmp_kaggriculture/**'
       - '.github/workflows/kaggriculture-eval.yml'
@@ -25,19 +25,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install numpy scipy
           python -m pip install 'git+https://github.com/Kaggle/kaggle-environments.git@2f22627ff7def9fc23d57bebcab184476153c678'
-      - name: Run staged E300 benchmark
+      - name: Run adaptive-market v24 benchmark
         env:
           PYTHONHASHSEED: '0'
           BENCH_WORKERS: '4'
           OMP_NUM_THREADS: '1'
           OPENBLAS_NUM_THREADS: '1'
           MKL_NUM_THREADS: '1'
-        run: python .tmp_kaggriculture/benchmark_e300.py
-      - name: Upload benchmark artifacts
+        run: python .tmp_kaggriculture/benchmark_v24.py
+      - name: Upload v24 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kaggriculture-e300-${{ github.run_id }}
-          path: .tmp_kaggriculture/out_e300
+          name: kaggriculture-v24-${{ github.run_id }}
+          path: .tmp_kaggriculture/out_v24
           if-no-files-found: warn
           retention-days: 2
