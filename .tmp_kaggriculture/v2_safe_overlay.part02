@@ -1,0 +1,227 @@
+        if quote > 1:
+            inventory += 1
+    market_inventory[item] = inventory
+    return revenue
+
+
+def _v2_orders_affordable(obs, orders, buffer=0.0):
+    farm = _farm(obs, _seat(obs))
+    money = float(_get(farm, "money", 0) or 0)
+    hire_index = int(_get(farm, "hires_today", 0) or 0)
+    unlocked = len(_get(farm, "unlocked_quadrants", []) or [])
+    market = _get(obs, "market", {}) or {}
+    market_inventory = {item: int(_get(_get(market, "inventory", {}) or {}, item, 10000) or 10000) for item in _V2_SELLABLE}
+    for order in orders:
+        if _is_sell(order):
+            money += _v2_sell_revenue(str(order[1]), int(order[2] or 0), market_inventory)
+            continue
+        cost, hire_index, unlocked = _v2_order_cost(obs, order, market_inventory, hire_index, unlocked)
+        if money + 1e-9 < cost:
+            return False
+        money -= cost
+    return money >= float(buffer)
+
+
+def _v2_expected_hands(route, step):
+    actions = _V2_ROUTE_ACTIONS[route]
+    index = min(max(0, int(step)), len(actions) - 1)
+    return len(actions[index].get("hands") or [])
+
+
+def _v2_feed_shortage(obs):
+    if not _V2_FEED_RESCUE:
+        return 0
+    farm = _farm(obs, _seat(obs))
+    private = _get(obs, "private", {}) or {}
+    shed = _get(private, "shed", {}) or {}
+    inventories = _get(private, "inventories", []) or []
+    available = int(_get(shed, "WHEAT", 0) or 0) + sum(int(_get(inv, "WHEAT", 0) or 0) for inv in inventories)
+    threatened = 0
+    for row in (_get(farm, "tiles", []) or []):
+        for tile in row or []:
+            if isinstance(tile, dict) and tile.get("animal") and not tile.get("fed_today") and int(tile.get("consecutive_unfed", 0) or 0) >= 1:
+                threatened += 1
+    return max(0, threatened - available)
+
+
+def _v2_cash_priority(obs, action, route):
+    if not _V2_CASH_PRIORITY:
+        return action
+    action = _copy_action(action)
+    step = _v2_step(obs)
+    farm = _farm(obs, _seat(obs))
+    market = list(action.get("market") or [])
+
+    # Recover a previously failed hire when the raw route already assumes that
+    # worker exists.  The new worker appears next turn; no physical route action
+    # is displaced in the current turn.
+    actual_hands = len(_get(farm, "hands", []) or [])
+    expected_hands = _v2_expected_hands(route, step)
+    existing_hires = sum(1 for order in market if order and order[0] == "HIRE")
+    missing_hires = max(0, expected_hands - actual_hands - existing_hires)
+    for _ in range(min(2, missing_hires)):
+        if len(market) < 10:
+            market.append(["HIRE"])
+
+    shortage = _v2_feed_shortage(obs)
+    existing_wheat = sum(max(0, int(order[2] or 0)) for order in market if len(order) >= 3 and order[0] == "BUY_PRODUCT" and order[1] == "WHEAT")
+    if shortage > existing_wheat and len(market) < 10:
+        market.append(["BUY_PRODUCT", "WHEAT", shortage - existing_wheat])
+
+    # Preserve the proven order when it is affordable.  Only under projected
+    # failure do we put valid sales and route-critical inputs before capex.
+    if step < 120 or _v2_orders_affordable(obs, market, buffer=0.0):
+        action["market"] = market[:10]
+        return action
+    priorities = {
+        "SELL": 0,
+        "HIRE": 1,
+        "BUY_PRODUCT": 2,
+        "BUY_SEED": 3,
+        "BUY_ANIMAL": 4,
+        "BUY_LAND": 5,
+    }
+    indexed = list(enumerate(market))
+    indexed.sort(key=lambda pair: (priorities.get(str(pair[1][0]), 9), pair[0]))
+    action["market"] = [order for _, order in indexed[:10]]
+    return action
+
+
+def _v2_non_sell_cost(obs, orders):
+    farm = _farm(obs, _seat(obs))
+    hire_index = int(_get(farm, "hires_today", 0) or 0)
+    unlocked = len(_get(farm, "unlocked_quadrants", []) or [])
+    market = _get(obs, "market", {}) or {}
+    inventory = {item: int(_get(_get(market, "inventory", {}) or {}, item, 10000) or 10000) for item in _V2_SELLABLE}
+    total = 0.0
+    for order in orders:
+        if _is_sell(order):
+            continue
+        cost, hire_index, unlocked = _v2_order_cost(obs, order, inventory, hire_index, unlocked)
+        total += cost
+    return total
+
+
+def _v2_floor_deferral(obs, action, state):
+    if not _V2_FLOOR_DEFERRAL:
+        return action
+    action = _copy_action(action)
+    step = _v2_step(obs)
+    day = int(_get(obs, "day", step // 24) or 0)
+    farm = _farm(obs, _seat(obs))
+    money = float(_get(farm, "money", 0) or 0)
+    market_state = _get(obs, "market", {}) or {}
+    prices = _get(market_state, "prices", {}) or {}
+    projected = Counter(_projected_shed(obs, action))
+    total_stock = sum(projected.values())
+    critical_cost = _v2_non_sell_cost(obs, action.get("market") or [])
+    reserve_ok = money >= critical_cost + 250.0
+    deferable = {"STRAWBERRY", "WOOL", "MILK"}
+    if day >= 18:
+        deferable.add("MELON")
+    market = []
+    for raw in action.get("market", []) or []:
+        order = list(raw)
+        if not _is_sell(order):
+            market.append(order)
+            continue
+        item = str(order[1])
+        quantity = max(0, int(order[2] or 0))
+        price = float(_get(prices, item, 1) or 1)
+        if (
+            item in deferable
+            and price <= max(1.0, 0.08 * float(_MARKET_PARAMS[item][0]))
+            and day < 25
+            and total_stock < 78
+            and reserve_ok
+        ):
+            state["pending"][item] += quantity
+            continue
+        market.append(order)
+    # Release deferred goods on recovery, liquidity/storage stress, or endgame.
+    already = Counter()
+    for order in market:
+        if _is_sell(order):
+            already[str(order[1])] += max(0, int(order[2] or 0))
+    for item in _V2_SELLABLE:
+        pending = min(int(state["pending"].get(item, 0)), max(0, int(projected.get(item, 0)) - int(already.get(item, 0))))
+        state["pending"][item] = pending
+        if pending <= 0:
+            continue
+        history = list(state["prices"].get(item, ()))
+        peak = max(history) if history else float(_MARKET_PARAMS[item][0])
+        price = float(_get(prices, item, 1) or 1)
+        release = (
+            day >= 25
+            or step >= 700
+            or total_stock >= 85
+            or money < critical_cost + 100.0
+            or price >= max(0.50 * float(_MARKET_PARAMS[item][0]), 0.65 * peak)
+        )
+        if not release:
+            continue
+        quantity = min(pending, 30)
+        existing = next((order for order in market if _is_sell(order) and order[1] == item), None)
+        if existing is not None:
+            existing[2] = int(existing[2] or 0) + quantity
+        elif len(market) < 10:
+            market.append(["SELL", item, quantity])
+        else:
+            continue
+        state["pending"][item] -= quantity
+    action["market"] = market[:10]
+    return action
+
+
+def _v2_force_liquidation(obs, action, state):
+    action = _copy_action(action)
+    step = _v2_step(obs)
+    if step < 716:
+        return action
+    projected = Counter(_projected_shed(obs, action))
+    market = [list(order) for order in action.get("market", []) if not _is_sell(order)]
+    prices = _get(_get(obs, "market", {}) or {}, "prices", {}) or {}
+    sells = [["SELL", item, int(quantity)] for item, quantity in projected.items() if item in _V2_SELLABLE and int(quantity) > 0]
+    sells.sort(key=lambda order: float(_get(prices, order[1], 1) or 1), reverse=True)
+    action["market"] = (sells + market)[:10]
+    for item in state["pending"]:
+        state["pending"][item] = 0
+    return action
+
+
+def _v2_base_action(obs, route):
+    global _ACTIONS
+    _ACTIONS = _V2_ROUTE_ACTIONS[route]
+    return _copy_action(_V2_PARENT_AGENT(obs))
+
+
+def _v2_agent(obs, configuration=None):
+    del configuration
+    try:
+        state = _v2_state(obs)
+        route = _v2_route(obs, state)
+        action = _v2_base_action(obs, route)
+        action = _v2_apply_carrot_substitution(obs, action, state, route)
+        action = _v2_local_animal_place(obs, action)
+        action = _v2_terminal_units(obs, action)
+        action = _v2_valid_sells(obs, action)
+        action = _v2_jit_seed_orders(obs, action, state, route)
+        action = _v2_floor_deferral(obs, action, state)
+        action = _v2_cash_priority(obs, action, route)
+        action = _v2_valid_sells(obs, action)
+        action = _v2_force_liquidation(obs, action, state)
+        return _align_hands(action, obs)
+    except Exception:
+        farm = _farm(obs, _seat(obs))
+        return {
+            "farmer": ["PASS"],
+            "hands": [["PASS"] for _ in (_get(farm, "hands", []) or [])],
+            "market": [],
+        }
+
+
+# Emergency animal feeding is inherited from the original agent and starts only
+# at the last safe moment, so it is compatible with the recorded route.
+_V17_FEED_GUARD = bool(_V2_FEED_RESCUE)
+agent = _v2_agent
+kaggriculture_e300_v2_agent = _v2_agent
