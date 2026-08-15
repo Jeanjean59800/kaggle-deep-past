@@ -1,0 +1,201 @@
+    missing_wheat = _v2_feed_reserve(obs)
+    existing_wheat_buys = sum(max(0, int(order[2] or 0)) for order in filtered if len(order) >= 3 and order[0] == "BUY_PRODUCT" and order[1] == "WHEAT")
+    if missing_wheat > existing_wheat_buys:
+        filtered.append(["BUY_PRODUCT", "WHEAT", missing_wheat - existing_wheat_buys])
+
+    # Sidecar seed acquisitions in small batches; no dead end-of-game stock.
+    deficits = _v2_plant_deficits(obs, state, route)
+    for crop in ("TOMATO", "CARROT", "STRAWBERRY"):
+        missing = max(0, int(deficits.get(crop, 0)) - int(seeds.get(crop, 0)) - int(planned_seed.get(crop, 0)))
+        if missing > 0 and day <= _V2_CROPS[crop]["latest"]:
+            quantity = min(3, missing)
+            filtered.append(["BUY_SEED", crop, quantity])
+            planned_seed[crop] += quantity
+
+    # Sparse animal sidecars.  Purchase at most one per turn and only while the
+    # production window can still amortize the animal.
+    if _V2_ENABLE_DYNAMIC_ANIMALS:
+        for animal in ("SHEEP", "GOOSE"):
+            desired = int(desired_animals.get(animal, 0))
+            remaining = max(0, desired - animal_holdings.get(animal, 0) - planned_animals.get(animal, 0))
+            latest = 22 if animal == "SHEEP" else 21
+            if remaining > 0 and day <= latest:
+                filtered.append(["BUY_ANIMAL", animal, 1])
+                planned_animals[animal] += 1
+                break
+
+    action["market"] = filtered
+    return action
+
+
+def _v2_sell_revenue(item, quantity, inventory):
+    revenue = 0.0
+    inventory = int(inventory)
+    for _ in range(max(0, int(quantity))):
+        quote = _market_price(item, inventory)
+        revenue += quote
+        if quote > 1:
+            inventory += 1
+    return revenue, inventory
+
+
+def _v2_market_planner(obs, action, state, route):
+    action = _copy_action(action)
+    if not _V2_ENABLE_CASH_GUARD:
+        return action
+    farm = _farm(obs, _seat(obs))
+    money = float(_get(farm, "money", 0) or 0)
+    hires_today = int(_get(farm, "hires_today", 0) or 0)
+    unlocked = len(_get(farm, "unlocked_quadrants", []) or [])
+    projected = Counter(_projected_shed(obs, action))
+    capacity = sum(projected.values())
+    market = _get(obs, "market", {}) or {}
+    inventory_state = {item: int(_get(_get(market, "inventory", {}) or {}, item, 10000) or 10000) for item in _V2_PRODUCTS}
+    seeds = Counter({str(k): max(0, int(v or 0)) for k, v in dict(_get(_get(obs, "private", {}) or {}, "seeds", {}) or {}).items()})
+
+    orders = [list(order) for order in (action.get("market") or []) if isinstance(order, (list, tuple)) and order]
+    priority = {"SELL": 0, "BUY_PRODUCT": 1, "HIRE": 2, "BUY_SEED": 3, "BUY_ANIMAL": 4, "BUY_LAND": 5}
+    indexed = list(enumerate(orders))
+    indexed.sort(key=lambda pair: (priority.get(str(pair[1][0]), 9), pair[0]))
+    accepted = []
+    hire_index = hires_today
+
+    # One-day feed reserve is protected from optional capex.
+    animals = sum(_v2_farm_counts(farm).get(animal, 0) for animal in _V2_ANIMALS)
+    reserve_floor = max(75.0, animals * max(1.0, float(_get(_get(market, "prices", {}) or {}, "WHEAT", 25) or 25)))
+
+    for _, order in indexed:
+        if len(accepted) >= 10:
+            break
+        op = str(order[0])
+        if op == "SELL" and len(order) >= 3 and order[1] in _V2_PRODUCTS:
+            item = str(order[1])
+            quantity = min(max(0, int(order[2] or 0)), max(0, int(projected.get(item, 0))))
+            if item == "WHEAT":
+                quantity = min(quantity, max(0, int(projected.get(item, 0)) - _v2_feed_reserve(obs) - 2))
+            if quantity <= 0:
+                continue
+            order[2] = quantity
+            revenue, inventory_state[item] = _v2_sell_revenue(item, quantity, inventory_state[item])
+            money += revenue
+            projected[item] -= quantity
+            capacity -= quantity
+            accepted.append(order)
+            continue
+        if op == "HIRE":
+            cost = float(_v2_fib(hire_index))
+            if money < cost:
+                continue
+            money -= cost
+            hire_index += 1
+            accepted.append(["HIRE"])
+            continue
+        if op == "BUY_PRODUCT" and len(order) >= 3 and str(order[1]) in ("WHEAT", "FERTILIZER"):
+            item = str(order[1])
+            requested = max(0, int(order[2] or 0))
+            bought = 0
+            for _ in range(requested):
+                if capacity >= 100:
+                    break
+                quote_inventory = inventory_state[item] - 1
+                cost = float(_market_price(item, quote_inventory))
+                if money < cost:
+                    break
+                money -= cost
+                inventory_state[item] = quote_inventory
+                capacity += 1
+                projected[item] += 1
+                bought += 1
+            if bought:
+                accepted.append(["BUY_PRODUCT", item, bought])
+            continue
+        if op == "BUY_SEED" and len(order) >= 3 and str(order[1]) in _V2_CROPS:
+            crop = str(order[1])
+            requested = max(0, int(order[2] or 0))
+            unit = float(_V2_CROPS[crop]["seed"])
+            affordable = min(requested, int(money // unit)) if unit > 0 else requested
+            if affordable <= 0:
+                continue
+            money -= affordable * unit
+            seeds[crop] += affordable
+            accepted.append(["BUY_SEED", crop, affordable])
+            continue
+        if op == "BUY_ANIMAL" and len(order) >= 3 and str(order[1]) in _V2_ANIMALS:
+            animal = str(order[1])
+            requested = max(0, int(order[2] or 0))
+            unit = float(_V2_ANIMALS[animal]["cost"])
+            bought = 0
+            for _ in range(requested):
+                if capacity >= 100 or money - unit < reserve_floor:
+                    break
+                money -= unit
+                capacity += 1
+                projected[animal] += 1
+                bought += 1
+            if bought:
+                accepted.append(["BUY_ANIMAL", animal, bought])
+            continue
+        if op == "BUY_LAND":
+            extra = max(0, unlocked - 1)
+            cost = float((1000, 2000, 4000)[extra]) if extra < 3 else float("inf")
+            if money - cost < max(reserve_floor, 500.0):
+                continue
+            money -= cost
+            unlocked += 1
+            accepted.append(["BUY_LAND"])
+            continue
+    action["market"] = accepted[:10]
+    return action
+
+
+def _v2_terminal_controller(obs, action, state):
+    if not _V2_ENABLE_TERMINAL:
+        return action
+    step = _v2_step(obs)
+    if step < 696:
+        return action
+    action = _copy_action(action)
+    # The task controller already prioritizes feasible harvest/return paths.
+    # At the final two actions, liquidate every item projected into the shed.
+    if step >= 717:
+        projected = Counter(_projected_shed(obs, action))
+        non_sells = [list(order) for order in action.get("market", []) or [] if not _is_sell(order)]
+        prices = _get(_get(obs, "market", {}) or {}, "prices", {}) or {}
+        sells = [["SELL", item, int(quantity)] for item, quantity in projected.items() if item in _V2_PRODUCTS and int(quantity) > 0]
+        sells.sort(key=lambda order: float(_get(prices, order[1], 1) or 1), reverse=True)
+        action["market"] = (sells + non_sells)[:10]
+    return action
+
+
+def _v2_base_action(obs, route):
+    global _ACTIONS
+    _ACTIONS = _V2_ROUTE_ACTIONS[route]
+    return _copy_action(_V2_BASE_AGENT(obs))
+
+
+def _v2_agent(obs, configuration=None):
+    del configuration
+    try:
+        state = _v2_state(obs)
+        route = _v2_route(obs, state)
+        _v2_update_sidecars(obs, state, route)
+        action = _v2_base_action(obs, route)
+        action = _v2_task_controller(obs, action, state, route)
+        action = _v2_adaptive_sells(obs, action, state)
+        action = _v2_filter_and_add_orders(obs, action, state, route)
+        action = _v2_market_planner(obs, action, state, route)
+        action = _v2_terminal_controller(obs, action, state)
+        action = _v2_validate_units(obs, action)
+        state["last_action"] = _copy_action(action)
+        return action
+    except Exception:
+        farm = _farm(obs, _seat(obs))
+        return {
+            "farmer": ["PASS"],
+            "hands": [["PASS"] for _ in (_get(farm, "hands", []) or [])],
+            "market": [],
+        }
+
+
+agent = _v2_agent
+kaggriculture_e300_v2_agent = _v2_agent
