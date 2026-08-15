@@ -1,0 +1,63 @@
+    shutil.copy2(paths[selected_name], final_main)
+    main_sha = hashlib.sha256(final_main.read_bytes()).hexdigest()
+    submission_sha = deterministic_submission(final_main, OUT / "submission.tar.gz")
+
+    summaries = [identity_summary, *dev_summaries, *val_summaries, holdout_summary, *league_summaries]
+    fields = sorted({key for summary in summaries for key in summary})
+    with (OUT / "summary.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(summaries)
+
+    report = {
+        "experiment": "Kaggriculture E300 V2 staged locked-holdout benchmark",
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "environment_commit": ENV_COMMIT,
+        "target_notebook": TARGET_NOTEBOOK_URL,
+        "target_payload_sha256": TARGET_SHA256,
+        "protocol": {
+            "primary_unit": "one random seed averaged over both seat assignments",
+            "identity_seed_range": [identity_seeds[0], identity_seeds[-1]],
+            "development_seed_range": [development_seeds[0], development_seeds[-1]],
+            "validation_seed_range": [validation_seeds[0], validation_seeds[-1]],
+            "holdout_seed_range": [holdout_seeds[0], holdout_seeds[-1]],
+            "holdout_seed_blocks": len(holdout_seeds),
+            "holdout_games": 2 * len(holdout_seeds),
+            "selection_rule": "highest BCa lower confidence bound, then mean margin, fewer losses and lower variance",
+            "success_rule": "locked holdout BCa 95% lower bound > 0 and one-sided paired t p < 0.05",
+            "post_holdout_policy_changes": 0,
+            "league_used_for_selection": False,
+        },
+        "variants": [
+            {
+                "name": variant.name,
+                "eligible": variant.eligible,
+                "description": variant.description,
+                "use_overlay": variant.use_overlay,
+            }
+            for variant in VARIANTS
+        ],
+        "identity_control": identity_summary,
+        "development_summaries": dev_summaries,
+        "development_ranking": [str(summary["variant"]) for summary in eligible_ranked],
+        "finalists": finalist_names,
+        "validation_summaries": val_summaries,
+        "selected_variant": selected_name,
+        "locked_holdout_summary": holdout_summary,
+        "diagnostic_league_summaries": league_summaries,
+        "main_sha256": main_sha,
+        "submission_sha256": submission_sha,
+        "success": bool(holdout_summary["significant_positive_at_5pct"]),
+    }
+    (OUT / "report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=True),
+        encoding="utf-8",
+    )
+    print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=True), flush=True)
+
+    if not report["success"]:
+        raise SystemExit("Locked holdout did not pass the predeclared significance rule")
+
+
+if __name__ == "__main__":
+    main()
