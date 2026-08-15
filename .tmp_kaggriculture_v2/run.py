@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
+import sys
 import zlib
 from pathlib import Path
 
@@ -27,6 +29,9 @@ def decode_b85(path: Path) -> str:
 # Validate and normalize the controller payload before the benchmark imports it.
 decode_b85(ROOT / "overlay.b85")
 source = decode_b85(ROOT / "benchmark.b85")
-code_path = ROOT / "benchmark_v2.py"
-namespace = {"__name__": "__main__", "__file__": str(code_path)}
-exec(compile(source, str(code_path), "exec"), namespace)
+code_path = ROOT / "benchmark_v2_runtime.py"
+code_path.write_text(source, encoding="utf-8")
+
+# Execute from a real Python file. ProcessPoolExecutor workers must be able to
+# import functions from __main__; an exec()-only namespace is not picklable.
+os.execv(sys.executable, [sys.executable, str(code_path)])
