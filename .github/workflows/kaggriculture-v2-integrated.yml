@@ -1,0 +1,44 @@
+name: Kaggriculture V2 integrated benchmark
+
+on:
+  push:
+    branches:
+      - scratch/kaggriculture-v2-integrated-20260815
+    paths:
+      - '.tmp_kaggriculture_v2/**'
+      - '.github/workflows/kaggriculture-v2-integrated.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned environment and statistics dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy
+          python -m pip install 'git+https://github.com/Kaggle/kaggle-environments.git@28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c'
+      - name: Run staged V2 benchmark
+        env:
+          PYTHONHASHSEED: '0'
+          BENCH_WORKERS: '4'
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+        run: python .tmp_kaggriculture_v2/run.py
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggriculture-v2-${{ github.run_id }}
+          path: .tmp_kaggriculture_v2/out
+          if-no-files-found: warn
+          retention-days: 2
