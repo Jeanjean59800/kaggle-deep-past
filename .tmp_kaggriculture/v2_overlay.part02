@@ -1,0 +1,222 @@
+        "FEED": 0, "DROP": 1, "PLACE": 1, "HARVEST": 2,
+        "WATER": 3, "COLLECT_FERTILIZER": 4, "FERTILIZE": 5,
+        "DIG": 6, "PLANT": 7, "BUILD_PASTURE": 8, "BUILD_COOP": 8,
+        "PICKUP": 7, "CARE": 7, "NORTH": 9, "SOUTH": 9,
+        "EAST": 9, "WEST": 9, "PASS": 99,
+    }.get(op, 99)
+
+
+def _v2_task_action(task, actor, positions, inventories, farm, obs):
+    position = positions[actor]
+    target = task["target"]
+    if tuple(map(int, position)) != tuple(map(int, target)):
+        return _v2_move(position, target)
+    op = task["op"]
+    if op == "ACQUIRE_WHEAT":
+        quantity = max(1, min(int(task.get("quantity", 1)), int(_get(_get(_get(obs, "private", {}) or {}, "shed", {}) or {}, "WHEAT", 0) or 0)))
+        return ["PICKUP", "WHEAT", quantity]
+    if op == "ACQUIRE_ANIMAL":
+        return ["PICKUP", str(task["item"]), 1]
+    if op == "DROP":
+        return ["DROP"]
+    if op == "PLANT":
+        return ["PLANT", str(task["item"])]
+    if op == "PLACE":
+        return ["PLACE", str(task["item"]), 1]
+    return [op]
+
+
+def _v2_task_controller(obs, action, state, route):
+    if not _V2_ENABLE_TASK_CONTROLLER:
+        return _v2_validate_units(obs, action)
+    action = _v2_validate_units(obs, action)
+    seat = _seat(obs)
+    farm = _farm(obs, seat)
+    tiles = _get(farm, "tiles", []) or []
+    size = len(tiles) or 10
+    positions = _v2_positions(farm)
+    inventories = _v2_inventories(obs, len(positions))
+    day = int(_get(obs, "day", _v2_step(obs) // 24) or 0)
+    hour = int(_get(obs, "hour", _v2_step(obs) % 24) or 0)
+    step = _v2_step(obs)
+    shed, carried, seeds = _v2_private_totals(obs)
+    farm_counts = _v2_farm_counts(farm)
+    desired_animals = _v2_desired_animals(obs, state, route)
+    tasks = []
+
+    # Actor-specific cargo tasks.
+    for actor, (position, inventory) in enumerate(zip(positions, inventories)):
+        total = sum(max(0, int(v or 0)) for v in inventory.values())
+        for animal in _V2_ANIMALS:
+            if int(inventory.get(animal, 0) or 0) <= 0:
+                continue
+            structure = _V2_ANIMALS[animal]["structure"]
+            targets = []
+            for y, row in enumerate(tiles):
+                for x, tile in enumerate(row or []):
+                    if isinstance(tile, dict) and tile.get("kind") == structure and not tile.get("animal"):
+                        targets.append((x, y))
+            if targets:
+                target = min(targets, key=lambda p: (_v2_distance(position, p), p))
+                tasks.append({"priority": 0, "target": target, "op": "PLACE", "item": animal, "actors": {actor}})
+        sellable = sum(int(inventory.get(item, 0) or 0) for item in _V2_PRODUCTS)
+        if sellable > 0 and (hour >= 20 or step >= 680 or total >= 8):
+            tasks.append({"priority": 1 if step >= 696 else 3, "target": _v2_nearest_shed(position, size), "op": "DROP", "actors": {actor}})
+
+    # Tile tasks.
+    for y, row in enumerate(tiles):
+        for x, tile in enumerate(row or []):
+            target = (x, y)
+            if not isinstance(tile, dict):
+                continue
+            kind = str(tile.get("kind", ""))
+            animal = str(tile.get("animal", ""))
+            if animal:
+                if not bool(tile.get("fed_today")):
+                    priority = 0 if int(tile.get("consecutive_unfed", 0) or 0) >= 1 or hour >= 18 else 3
+                    tasks.append({"priority": priority, "target": target, "op": "FEED", "requires": "WHEAT"})
+                if int(tile.get("yield_units", 0) or 0) > 0:
+                    tasks.append({"priority": 1 if step >= 696 else 2, "target": target, "op": "HARVEST"})
+                if bool(tile.get("fertilizer_available")):
+                    tasks.append({"priority": 4, "target": target, "op": "COLLECT_FERTILIZER"})
+            elif kind == "PLANT":
+                crop = str(tile.get("crop", ""))
+                if _v2_mature_plant(tile, day):
+                    age = day - int(tile.get("planted_day", day) or day)
+                    max_day = int(_V2_CROPS.get(crop, {}).get("max_day", 0))
+                    if _V2_CROPS.get(crop, {}).get("ongoing") or age >= max_day or step >= 696:
+                        tasks.append({"priority": 0 if step >= 696 else 2, "target": target, "op": "HARVEST"})
+                if not bool(tile.get("watered_today")):
+                    consecutive = int(tile.get("consecutive_unwatered", 0) or 0)
+                    crop_data = _V2_CROPS.get(crop, {})
+                    age = day - int(tile.get("planted_day", day) or day)
+                    bonus_window = crop_data and (crop_data.get("ongoing") or age >= (int(crop_data.get("max_day", 0)) + 1) // 2)
+                    if consecutive >= 1:
+                        tasks.append({"priority": 0, "target": target, "op": "WATER"})
+                    elif bonus_window and hour >= 10:
+                        tasks.append({"priority": 4, "target": target, "op": "WATER"})
+            elif kind == "WEED":
+                tasks.append({"priority": 6, "target": target, "op": "DIG"})
+
+    # Feed acquisition tasks if nobody currently carries enough wheat.
+    unfed = sum(1 for task in tasks if task["op"] == "FEED")
+    carried_wheat = sum(int(inv.get("WHEAT", 0) or 0) for inv in inventories)
+    if unfed > carried_wheat and int(shed.get("WHEAT", 0)) > 0:
+        needed = min(int(shed.get("WHEAT", 0)), unfed - carried_wheat)
+        for actor, position in enumerate(positions):
+            if _v2_at_shed(position, size):
+                tasks.append({"priority": 0, "target": tuple(position), "op": "ACQUIRE_WHEAT", "quantity": needed, "actors": {actor}})
+            elif hour <= 16:
+                tasks.append({"priority": 2, "target": _v2_nearest_shed(position, size), "op": "ACQUIRE_WHEAT", "quantity": needed, "actors": {actor}})
+
+    # Animal acquisition / structure recovery.
+    for animal, desired in desired_animals.items():
+        held = int(farm_counts.get(animal, 0)) + int(shed.get(animal, 0)) + int(carried.get(animal, 0))
+        if held <= 0 or int(shed.get(animal, 0)) <= 0:
+            continue
+        structure = _V2_ANIMALS[animal]["structure"]
+        if int(farm_counts.get(structure + "_EMPTY", 0)) > 0:
+            for actor, position in enumerate(positions):
+                if _v2_at_shed(position, size) and int(inventories[actor].get(animal, 0) or 0) == 0:
+                    tasks.append({"priority": 1, "target": tuple(position), "op": "ACQUIRE_ANIMAL", "item": animal, "actors": {actor}})
+                    break
+
+    # Catch up missing base plants and add bounded sidecars.
+    deficits = _v2_plant_deficits(obs, state, route)
+    empty_tiles = []
+    for y, row in enumerate(tiles):
+        for x, tile in enumerate(row or []):
+            if tile is None:
+                empty_tiles.append((x, y))
+    for crop in ("TOMATO", "CARROT", "STRAWBERRY", "WHEAT", "MELON"):
+        quantity = min(int(deficits.get(crop, 0)), int(seeds.get(crop, 0)), len(empty_tiles))
+        for _ in range(quantity):
+            if not empty_tiles:
+                break
+            # Spread sidecars near the shed to make terminal harvest feasible.
+            target = min(empty_tiles, key=lambda p: (min(_v2_distance(p, s) for s in _shed_access(size)), p))
+            empty_tiles.remove(target)
+            tasks.append({"priority": 7 if crop in ("CARROT", "TOMATO") else 8, "target": target, "op": "PLANT", "item": crop})
+
+    # Build missing structures for already bought or approved sidecar animals.
+    available_empty = list(empty_tiles)
+    for structure, animal in (("COOP", "GOOSE"), ("PASTURE", "SHEEP")):
+        desired = desired_animals.get(animal, 0)
+        current_structures = int(farm_counts.get(structure, 0))
+        pending_animals = int(shed.get(animal, 0)) + int(carried.get(animal, 0))
+        required = max(0, min(desired, int(farm_counts.get(animal, 0)) + pending_animals) - current_structures)
+        for _ in range(min(required, len(available_empty))):
+            target = min(available_empty, key=lambda p: (min(_v2_distance(p, s) for s in _shed_access(size)), p))
+            available_empty.remove(target)
+            tasks.append({"priority": 7, "target": target, "op": "BUILD_" + structure})
+
+    # Terminal feasibility: do not send an actor to harvest something that cannot
+    # be returned to the shed before the final action.
+    remaining = max(0, _V2_END_STEP - step)
+    if step >= 696:
+        feasible = []
+        for task in tasks:
+            if task["op"] != "HARVEST":
+                feasible.append(task)
+                continue
+            best = min((_v2_distance(pos, task["target"]) for pos in positions), default=10**9)
+            return_dist = min((_v2_distance(task["target"], shed_pos) for shed_pos in _shed_access(size)), default=10**9)
+            if best + 1 + return_dist + 1 <= remaining:
+                feasible.append(task)
+        tasks = feasible
+
+    units = [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]
+    while len(units) < len(positions):
+        units.append(["PASS"])
+    units = units[:len(positions)]
+    priorities = [_v2_base_priority(unit) for unit in units]
+    assigned_actors = set()
+    assigned_targets = set()
+    tasks.sort(key=lambda task: (int(task["priority"]), task["target"], task["op"]))
+    for task in tasks:
+        target = tuple(task["target"])
+        if target in assigned_targets and task["op"] not in ("ACQUIRE_WHEAT", "DROP"):
+            continue
+        allowed = set(task.get("actors", range(len(positions))))
+        candidates = []
+        for actor in allowed:
+            if actor in assigned_actors or actor >= len(positions):
+                continue
+            if priorities[actor] <= int(task["priority"]):
+                continue
+            if (
+                not _V2_ALLOW_NONCRITICAL_OVERRIDE
+                and priorities[actor] < 99
+                and int(task["priority"]) > 1
+            ):
+                continue
+            requirement = task.get("requires")
+            if requirement and int(inventories[actor].get(requirement, 0) or 0) <= 0:
+                continue
+            candidates.append((
+                _v2_distance(positions[actor], target),
+                priorities[actor],
+                actor,
+            ))
+        if not candidates:
+            continue
+        _, _, actor = min(candidates)
+        candidate = _v2_task_action(task, actor, positions, inventories, farm, obs)
+        if _v2_action_valid(obs, actor, candidate):
+            units[actor] = candidate
+            priorities[actor] = int(task["priority"])
+            assigned_actors.add(actor)
+            assigned_targets.add(target)
+
+    action["farmer"] = units[0] if units else ["PASS"]
+    action["hands"] = units[1:]
+    return _v2_validate_units(obs, action)
+
+
+def _v2_fib(index):
+    a, b = 1, 1
+    for _ in range(max(0, int(index))):
+        a, b = b, a + b
+    return a
+
+
