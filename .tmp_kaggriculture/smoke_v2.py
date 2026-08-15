@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -12,6 +13,7 @@ spec = importlib.util.spec_from_file_location("benchmark_v2", ROOT / "benchmark_
 if spec is None or spec.loader is None:
     raise RuntimeError("Cannot import benchmark_v2.py")
 b = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = b
 spec.loader.exec_module(b)
 
 if OUT.exists():
