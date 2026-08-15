@@ -1,0 +1,93 @@
+        with gzip.GzipFile(filename="", mode="wb", fileobj=handle, mtime=0) as gz:
+            gz.write(raw.getvalue())
+    with tarfile.open(archive_path, "r:gz") as archive:
+        if archive.getnames() != ["main.py"]:
+            raise RuntimeError("Submission archive must contain exactly main.py")
+        if archive.extractfile("main.py").read() != payload:
+            raise RuntimeError("Submission archive payload mismatch")
+    return hashlib.sha256(archive_path.read_bytes()).hexdigest()
+
+
+def main() -> None:
+    if OUT.exists():
+        shutil.rmtree(OUT)
+    OUT.mkdir(parents=True)
+    target_payload = exact_target_payload()
+    paths = build_agents(target_payload)
+
+    # Symmetry and state-reset control.
+    identity_seeds = list(range(301000, 301004))
+    identity_rows = evaluate_parallel(
+        "target_exact", paths["target_exact"], "target_exact", paths["target_exact"],
+        "identity_control", identity_seeds,
+    )
+    write_rows(identity_rows, OUT / "identity_control.csv")
+    identity_summary = summarize(identity_rows)
+    if any(row.paired_margin != 0 for row in identity_rows):
+        raise RuntimeError(f"Identity control failed: {identity_summary}")
+
+    # Stage 1: compact development ranking.  This set is never used for claims.
+    development_seeds = list(range(410000, 410016))
+    dev_rows: list[SeedResult] = []
+    dev_summaries: list[dict[str, object]] = []
+    for variant in VARIANTS:
+        rows = evaluate_parallel(
+            variant.name, paths[variant.name], "target_exact", paths["target_exact"],
+            "development", development_seeds,
+        )
+        dev_rows.extend(rows)
+        summary = summarize(rows)
+        summary["eligible"] = variant.eligible
+        summary["description"] = variant.description
+        dev_summaries.append(summary)
+    write_rows(dev_rows, OUT / "development_results.csv")
+
+    eligible_ranked = sorted(
+        [summary for summary in dev_summaries if bool(summary.get("eligible"))],
+        key=rank_key,
+        reverse=True,
+    )
+    finalist_names = [str(summary["variant"]) for summary in eligible_ranked[:3]]
+    print(f"Development finalists: {finalist_names}", flush=True)
+
+    # Stage 2: independent validation selects exactly one frozen V2 policy.
+    validation_seeds = list(range(520000, 520024))
+    val_rows: list[SeedResult] = []
+    val_summaries: list[dict[str, object]] = []
+    for name in finalist_names:
+        rows = evaluate_parallel(
+            name, paths[name], "target_exact", paths["target_exact"],
+            "validation", validation_seeds,
+        )
+        val_rows.extend(rows)
+        val_summaries.append(summarize(rows))
+    write_rows(val_rows, OUT / "validation_results.csv")
+    selected = max(val_summaries, key=rank_key)
+    selected_name = str(selected["variant"])
+    print(f"Policy locked before holdout: {selected_name}", flush=True)
+
+    # Stage 3: untouched locked holdout.  No policy decision follows this point.
+    holdout_seeds = list(range(730000, 730080))
+    holdout_rows = evaluate_parallel(
+        selected_name, paths[selected_name], "target_exact", paths["target_exact"],
+        "locked_holdout", holdout_seeds,
+    )
+    write_rows(holdout_rows, OUT / "holdout_results.csv")
+    holdout_summary = summarize(holdout_rows)
+
+    # Independent diagnostic league; never used to alter the locked policy.
+    league_rows: list[SeedResult] = []
+    league_summaries: list[dict[str, object]] = []
+    league_seeds = list(range(860000, 860012))
+    for opponent in ("preemption_only", "mapleleaf_42", "public_v23"):
+        if opponent not in paths:
+            continue
+        rows = evaluate_parallel(
+            selected_name, paths[selected_name], opponent, paths[opponent],
+            "diagnostic_league", league_seeds,
+        )
+        league_rows.extend(rows)
+        league_summaries.append(summarize(rows))
+    write_rows(league_rows, OUT / "league_results.csv")
+
+    final_main = OUT / "main.py"
