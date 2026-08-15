@@ -1,0 +1,253 @@
+    carried = Counter()
+    for inventory in _get(private, "inventories", []) or []:
+        carried.update({str(k): max(0, int(v or 0)) for k, v in dict(inventory or {}).items()})
+    seeds = Counter({str(k): max(0, int(v or 0)) for k, v in dict(_get(private, "seeds", {}) or {}).items()})
+    return shed, carried, seeds
+
+
+def _v2_opponent_exposure(obs, item):
+    seat = _seat(obs)
+    farms = list(_get(obs, "farms", []) or [])
+    if len(farms) < 2:
+        return 0.0
+    opponent = _v2_farm_counts(farms[1 - seat])
+    if item in _V2_CROPS:
+        return float(opponent.get(item, 0))
+    animal = {"EGG": "GOOSE", "MILK": "COW", "WOOL": "SHEEP"}.get(item)
+    return float(opponent.get(animal, 0)) if animal else 0.0
+
+
+def _v2_update_sidecars(obs, state, route):
+    if not _V2_ENABLE_SIDECARS:
+        return
+    day = int(_get(obs, "day", _v2_step(obs) // 24) or 0)
+    counts = _v2_shop_counts(obs)
+    market = _get(obs, "market", {}) or {}
+    inventory = _get(market, "inventory", {}) or {}
+    prices = _get(market, "prices", {}) or {}
+
+    carrot_score = 2.0 * counts.get("PET_CAFE", 0) + counts.get("FARMERS_MARKET", 0) - 0.35 * _v2_opponent_exposure(obs, "CARROT")
+    tomato_score = counts.get("PIZZA_SHOP", 0) + counts.get("FARMERS_MARKET", 0) - 0.30 * _v2_opponent_exposure(obs, "TOMATO")
+    strawberry_score = (
+        counts.get("ICE_CREAM_SHOP", 0) + counts.get("SMOOTHIE_SHOP", 0)
+        + counts.get("BRUNCH_SPOT", 0) + counts.get("FARMERS_MARKET", 0)
+        - 0.10 * _v2_opponent_exposure(obs, "STRAWBERRY")
+    )
+    egg_score = counts.get("BAKERY", 0) + counts.get("BRUNCH_SPOT", 0) - 0.50 * _v2_opponent_exposure(obs, "EGG")
+    yarn = counts.get("YARN_STORE", 0)
+
+    if day <= _V2_CROPS["CARROT"]["latest"]:
+        scarcity = max(0, 10000 - int(_get(inventory, "CARROT", 10000) or 10000))
+        price = float(_get(prices, "CARROT", 35) or 35)
+        target = 6 if carrot_score >= 5 else 4 if carrot_score >= 3 else 2 if carrot_score >= 1 and (price >= 55 or scarcity >= 180) else 0
+        state["sidecar_targets"]["CARROT"] = max(state["sidecar_targets"]["CARROT"], target)
+    if day <= _V2_CROPS["TOMATO"]["latest"]:
+        scarcity = max(0, 10000 - int(_get(inventory, "TOMATO", 10000) or 10000))
+        price = float(_get(prices, "TOMATO", 60) or 60)
+        target = 4 if tomato_score >= 3 else 3 if tomato_score >= 2 else 2 if tomato_score >= 1 and (price >= 90 or scarcity >= 90) else 0
+        state["sidecar_targets"]["TOMATO"] = max(state["sidecar_targets"]["TOMATO"], target)
+    if day <= _V2_CROPS["STRAWBERRY"]["latest"]:
+        target = 3 if strawberry_score >= 5 else 2 if strawberry_score >= 4 else 0
+        state["sidecar_targets"]["STRAWBERRY"] = max(state["sidecar_targets"]["STRAWBERRY"], target)
+    if day <= 22:
+        price = float(_get(prices, "EGG", 50) or 50)
+        target = 2 if egg_score >= 6 and price >= 65 else 1 if egg_score >= 4 else 0
+        state["sidecar_targets"]["GOOSE"] = max(state["sidecar_targets"]["GOOSE"], target)
+    if day <= 22 and route == "low":
+        target = min(4, 2 * yarn)
+        state["sidecar_targets"]["SHEEP"] = max(state["sidecar_targets"]["SHEEP"], target)
+
+
+def _v2_desired_animals(obs, state, route):
+    plan = _V2_PLAN[route]["final_animals"]
+    counts = _v2_shop_counts(obs)
+    day = int(_get(obs, "day", _v2_step(obs) // 24) or 0)
+    milk_score = counts.get("PIZZA_SHOP", 0) + counts.get("ICE_CREAM_SHOP", 0) + counts.get("SMOOTHIE_SHOP", 0)
+    cows = int(plan.get("COW", 0))
+    if _V2_ENABLE_DYNAMIC_ANIMALS and route == "low" and day >= 9:
+        cows = 10 if milk_score >= 2 else 8 if milk_score == 1 else 6
+    sheep = int(plan.get("SHEEP", 0)) + int(state["sidecar_targets"].get("SHEEP", 0))
+    geese = int(state["sidecar_targets"].get("GOOSE", 0))
+    return {"COW": cows, "SHEEP": sheep, "GOOSE": geese}
+
+
+def _v2_desired_plant_cumulative(state, route, step, crop):
+    index = min(max(0, int(step)), len(_V2_ROUTE_ACTIONS[route]))
+    base = int(_V2_PLAN[route]["cum_plants"][index].get(crop, 0))
+    extra = int(state["sidecar_targets"].get(crop, 0))
+    return base + extra
+
+
+def _v2_plant_deficits(obs, state, route):
+    step = _v2_step(obs)
+    day = int(_get(obs, "day", step // 24) or 0)
+    deficits = {}
+    for crop, data in _V2_CROPS.items():
+        if day > data["latest"]:
+            deficits[crop] = 0
+            continue
+        desired = _v2_desired_plant_cumulative(state, route, step, crop)
+        deficits[crop] = max(0, desired - int(state["actual_plants"].get(crop, 0)))
+    return deficits
+
+
+def _v2_positions(farm):
+    return [list(_get(farm, "farmer", [0, 0]) or [0, 0]), *[list(p) for p in (_get(farm, "hands", []) or [])]]
+
+
+def _v2_inventories(obs, count):
+    inventories = [dict(inv or {}) for inv in (_get(_get(obs, "private", {}) or {}, "inventories", []) or [])]
+    while len(inventories) < count:
+        inventories.append({})
+    return inventories[:count]
+
+
+def _v2_at_shed(position, size):
+    try:
+        return (int(position[0]), int(position[1])) in _shed_access(size)
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def _v2_tile(farm, position):
+    return _tile_at(farm, position)
+
+
+def _v2_mature_plant(tile, day):
+    if not isinstance(tile, dict) or tile.get("kind") != "PLANT":
+        return False
+    crop = str(tile.get("crop"))
+    data = _V2_CROPS.get(crop)
+    if not data or int(tile.get("yield_units", 0) or 0) <= 0:
+        return False
+    return day - int(tile.get("planted_day", day) or day) >= int(data["first"])
+
+
+def _v2_action_valid(obs, actor, action, seed_left=None, pickup_left=None):
+    if not isinstance(action, (list, tuple)) or not action:
+        return False
+    op = str(action[0])
+    if op == "PASS":
+        return True
+    seat = _seat(obs)
+    farm = _farm(obs, seat)
+    positions = _v2_positions(farm)
+    if actor >= len(positions):
+        return False
+    pos = positions[actor]
+    tiles = _get(farm, "tiles", []) or []
+    size = len(tiles) or 10
+    inventories = _v2_inventories(obs, len(positions))
+    inv = inventories[actor]
+    tile = _v2_tile(farm, pos)
+    day = int(_get(obs, "day", _v2_step(obs) // 24) or 0)
+    if op in ("NORTH", "SOUTH", "EAST", "WEST"):
+        dx, dy = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}[op]
+        return 0 <= int(pos[0]) + dx < size and 0 <= int(pos[1]) + dy < size
+    if op == "DROP":
+        return _v2_at_shed(pos, size) and sum(max(0, int(v or 0)) for v in inv.values()) > 0
+    if op == "PICKUP":
+        if len(action) < 2 or not _v2_at_shed(pos, size):
+            return False
+        item = str(action[1])
+        requested = max(1, int(action[2] or 1)) if len(action) >= 3 else 1
+        available = int((pickup_left or {}).get(item, _get(_get(_get(obs, "private", {}) or {}, "shed", {}) or {}, item, 0)) or 0)
+        return available >= min(1, requested)
+    if tile == "LOCKED":
+        return False
+    if op == "PLACE":
+        if len(action) < 2:
+            return False
+        item = str(action[1])
+        if item in _V2_ANIMALS and isinstance(tile, dict) and tile.get("kind") == _V2_ANIMALS[item]["structure"] and not tile.get("animal"):
+            return int(inv.get(item, 0) or 0) > 0
+        return _v2_at_shed(pos, size) and int(inv.get(item, 0) or 0) > 0
+    if op == "PLANT":
+        if len(action) < 2 or tile is not None:
+            return False
+        crop = str(action[1])
+        if crop not in _V2_CROPS or day > _V2_CROPS[crop]["latest"]:
+            return False
+        available = int((seed_left or {}).get(crop, _get(_get(_get(obs, "private", {}) or {}, "seeds", {}) or {}, crop, 0)) or 0)
+        return available > 0
+    if op == "WATER":
+        return isinstance(tile, dict) and tile.get("kind") == "PLANT" and not bool(tile.get("watered_today"))
+    if op == "HARVEST":
+        return _v2_mature_plant(tile, day) or (isinstance(tile, dict) and tile.get("animal") and int(tile.get("yield_units", 0) or 0) > 0)
+    if op == "FERTILIZE":
+        return isinstance(tile, dict) and tile.get("kind") == "PLANT" and int(inv.get("FERTILIZER", 0) or 0) > 0
+    if op == "DIG":
+        return tile not in (None, "LOCKED") and not (isinstance(tile, dict) and tile.get("animal"))
+    if op == "BUILD_COOP":
+        return tile is None
+    if op == "BUILD_PASTURE":
+        return tile is None
+    if op == "FEED":
+        return isinstance(tile, dict) and tile.get("animal") and not bool(tile.get("fed_today")) and int(inv.get("WHEAT", 0) or 0) > 0
+    if op == "COLLECT_FERTILIZER":
+        return isinstance(tile, dict) and tile.get("animal") and bool(tile.get("fertilizer_available"))
+    if op == "CARE":
+        return isinstance(tile, dict) and tile.get("animal") and not bool(tile.get("cared_today"))
+    return False
+
+
+def _v2_validate_units(obs, action):
+    action = _copy_action(action)
+    seat = _seat(obs)
+    farm = _farm(obs, seat)
+    count = 1 + len(_get(farm, "hands", []) or [])
+    units = [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]
+    if len(units) < count:
+        units.extend([["PASS"] for _ in range(count - len(units))])
+    units = units[:count]
+    _, _, seeds = _v2_private_totals(obs)
+    shed = Counter({str(k): max(0, int(v or 0)) for k, v in dict(_get(_get(obs, "private", {}) or {}, "shed", {}) or {}).items()})
+    validated = []
+    for actor, raw in enumerate(units):
+        candidate = list(raw or ["PASS"])
+        if not _v2_action_valid(obs, actor, candidate, seeds, shed):
+            candidate = ["PASS"]
+        elif candidate[0] == "PLANT":
+            crop = str(candidate[1])
+            seeds[crop] -= 1
+        elif candidate[0] == "PICKUP":
+            item = str(candidate[1])
+            quantity = max(1, int(candidate[2] or 1)) if len(candidate) >= 3 else 1
+            quantity = min(quantity, max(0, int(shed.get(item, 0))))
+            if quantity <= 0:
+                candidate = ["PASS"]
+            else:
+                if len(candidate) >= 3:
+                    candidate[2] = quantity
+                shed[item] -= quantity
+        validated.append(candidate)
+    action["farmer"] = validated[0] if validated else ["PASS"]
+    action["hands"] = validated[1:]
+    return action
+
+
+def _v2_move(position, target):
+    x, y = int(position[0]), int(position[1])
+    tx, ty = int(target[0]), int(target[1])
+    dx, dy = tx - x, ty - y
+    if abs(dx) >= abs(dy) and dx:
+        return ["EAST" if dx > 0 else "WEST"]
+    if dy:
+        return ["SOUTH" if dy > 0 else "NORTH"]
+    if dx:
+        return ["EAST" if dx > 0 else "WEST"]
+    return ["PASS"]
+
+
+def _v2_distance(a, b):
+    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))
+
+
+def _v2_nearest_shed(position, size):
+    access = sorted(_shed_access(size))
+    return min(access, key=lambda target: (_v2_distance(position, target), target))
+
+
+def _v2_base_priority(action):
+    op = str(action[0]) if isinstance(action, (list, tuple)) and action else "PASS"
+    return {
