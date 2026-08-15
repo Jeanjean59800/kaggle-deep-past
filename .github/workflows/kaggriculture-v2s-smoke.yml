@@ -1,0 +1,44 @@
+name: Kaggriculture surgical V2 fast smoke
+
+on:
+  push:
+    branches:
+      - scratch/kaggriculture-v2-20260815
+    paths:
+      - '.tmp_kaggriculture/benchmark_v2s_smoke.py'
+      - '.github/workflows/kaggriculture-v2s-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact engine and statistics dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy
+          python -m pip install 'git+https://github.com/Kaggle/kaggle-environments.git@28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c'
+      - name: Run fast smoke
+        working-directory: .tmp_kaggriculture
+        env:
+          PYTHONHASHSEED: '0'
+          BENCH_WORKERS: '4'
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+        run: python benchmark_v2s_smoke.py
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggriculture-v2s-smoke-${{ github.run_id }}
+          path: .tmp_kaggriculture/out_v2s_smoke
+          if-no-files-found: warn
+          retention-days: 3
