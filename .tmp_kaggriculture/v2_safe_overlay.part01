@@ -1,0 +1,240 @@
+    requests = Counter()
+    for unit in [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]:
+        if isinstance(unit, (list, tuple)) and len(unit) >= 2 and unit[0] == "PLANT":
+            requests[str(unit[1])] += 1
+    for crop, requested in requests.items():
+        # The engine atomically blocks all same-crop plants if seeds are short.
+        if requested <= seeds.get(crop, 0):
+            seeds[crop] -= requested
+    return seeds
+
+
+def _v2_carrot_target(obs):
+    if not _V2_CARROT_SIDECAR:
+        return 0
+    counts = _v2_shop_counts(obs)
+    market = _get(obs, "market", {}) or {}
+    price = float(_get(_get(market, "prices", {}) or {}, "CARROT", 35) or 35)
+    inventory = int(_get(_get(market, "inventory", {}) or {}, "CARROT", 10000) or 10000)
+    score = 2 * counts.get("PET_CAFE", 0) + counts.get("FARMERS_MARKET", 0)
+    if score >= 5 or price >= 140 or inventory <= 9700:
+        return 4
+    if score >= 3 or price >= 75 or inventory <= 9820:
+        return 2
+    return 0
+
+
+def _v2_apply_carrot_substitution(obs, action, state, route):
+    if not _V2_CARROT_SIDECAR:
+        return action
+    action = _copy_action(action)
+    day = int(_get(obs, "day", _v2_step(obs) // 24) or 0)
+    if day < 20 or day > _V2_CROP_DATA["CARROT"]["latest"]:
+        return action
+    target = _v2_carrot_target(obs)
+    remaining = max(0, target - int(state.get("carrot_substitutions", 0)))
+    if remaining <= 0:
+        return action
+    seeds = _v2_current_seed_projection(obs, {"farmer": ["PASS"], "hands": [], "market": []})
+    available = int(seeds.get("CARROT", 0))
+    if available <= 0:
+        return action
+    units = [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]
+    changed = 0
+    for unit in units:
+        if changed >= min(remaining, available):
+            break
+        if isinstance(unit, list) and len(unit) >= 2 and unit[0] == "PLANT" and unit[1] == "WHEAT":
+            unit[1] = "CARROT"
+            changed += 1
+    if changed:
+        state["carrot_substitutions"] += changed
+    action["farmer"] = units[0] if units else ["PASS"]
+    action["hands"] = units[1:]
+    return action
+
+
+def _v2_terminal_units(obs, action):
+    if not _V2_TERMINAL_RESCUE:
+        return action
+    step = _v2_step(obs)
+    if step < 700:
+        return action
+    action = _copy_action(action)
+    seat = _seat(obs)
+    farm = _farm(obs, seat)
+    positions = _v2_positions(farm)
+    inventories = _v2_inventories(obs, len(positions))
+    tiles = _get(farm, "tiles", []) or []
+    size = len(tiles) or 10
+    access = _shed_access(size)
+    day = int(_get(obs, "day", step // 24) or 0)
+    remaining = max(0, _V2_END_STEP - step)
+    units = [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]
+    while len(units) < len(positions):
+        units.append(["PASS"])
+    units = units[:len(positions)]
+    for actor, (position, inventory) in enumerate(zip(positions, inventories)):
+        carried = sum(max(0, int(inventory.get(item, 0) or 0)) for item in _V2_SELLABLE)
+        target = _v2_nearest_shed(position, size)
+        distance = _v2_distance(position, target)
+        if carried > 0:
+            if tuple(position) in access and (step >= 716 or remaining <= 1):
+                units[actor] = ["DROP"]
+            elif distance + 1 >= remaining or step >= 712:
+                units[actor] = _v2_move(position, target)
+            continue
+        tile = _v2_tile(farm, position)
+        if step >= 710 and _v2_mature(tile, day):
+            return_distance = min(_v2_distance(position, shed) for shed in access)
+            if 1 + return_distance + 1 <= remaining:
+                units[actor] = ["HARVEST"]
+    action["farmer"] = units[0] if units else ["PASS"]
+    action["hands"] = units[1:]
+    return action
+
+
+def _v2_local_animal_place(obs, action):
+    if not _V2_LOCAL_ANIMAL_RESCUE:
+        return action
+    action = _copy_action(action)
+    farm = _farm(obs, _seat(obs))
+    positions = _v2_positions(farm)
+    inventories = _v2_inventories(obs, len(positions))
+    units = [action.get("farmer", ["PASS"]), *list(action.get("hands") or [])]
+    while len(units) < len(positions):
+        units.append(["PASS"])
+    for actor, (position, inventory) in enumerate(zip(positions, inventories)):
+        if not units[actor] or units[actor][0] != "PASS":
+            continue
+        tile = _v2_tile(farm, position)
+        if not isinstance(tile, dict) or tile.get("animal"):
+            continue
+        for animal, data in _V2_ANIMAL_DATA.items():
+            if tile.get("kind") == data["structure"] and int(inventory.get(animal, 0) or 0) > 0:
+                units[actor] = ["PLACE", animal, 1]
+                break
+    action["farmer"] = units[0] if units else ["PASS"]
+    action["hands"] = units[1:]
+    return action
+
+
+def _v2_valid_sells(obs, action):
+    action = _copy_action(action)
+    projected = Counter(_projected_shed(obs, action))
+    reserved = Counter()
+    market = []
+    for raw in action.get("market", []) or []:
+        order = list(raw)
+        if not _is_sell(order):
+            market.append(order)
+            continue
+        item = str(order[1])
+        available = max(0, int(projected.get(item, 0)) - int(reserved.get(item, 0)))
+        quantity = min(max(0, int(order[2] or 0)), available)
+        if quantity <= 0:
+            continue
+        order[2] = quantity
+        reserved[item] += quantity
+        market.append(order)
+    action["market"] = market[:10]
+    return action
+
+
+def _v2_required_seed_stock(obs, state, route, action, crop):
+    step = _v2_step(obs)
+    stop = min(len(_V2_ROUTE_ACTIONS[route]), step + 1 + _V2_SEED_HORIZON)
+    required = _v2_route_plant_count(route, crop, step + 1, stop)
+    if crop == "CARROT" and _V2_CARROT_SIDECAR:
+        target = _v2_carrot_target(obs)
+        remaining = max(0, target - int(state.get("carrot_substitutions", 0)))
+        # Only reserve sidecar seeds if a compatible wheat planting appears in
+        # the same horizon and the carrot can mature before the season ends.
+        day = int(_get(obs, "day", step // 24) or 0)
+        if day <= _V2_CROP_DATA["CARROT"]["latest"]:
+            wheat_slots = _v2_route_plant_count(route, "WHEAT", step + 1, stop)
+            required += min(remaining, wheat_slots)
+    return required
+
+
+def _v2_jit_seed_orders(obs, action, state, route):
+    if not _V2_JIT_SEEDS:
+        return action
+    action = _copy_action(action)
+    step = _v2_step(obs)
+    day = int(_get(obs, "day", step // 24) or 0)
+    seeds = _v2_current_seed_projection(obs, action)
+    market = []
+    planned = Counter()
+    for raw in action.get("market", []) or []:
+        order = list(raw)
+        if not (len(order) >= 3 and order[0] == "BUY_SEED" and order[1] in _V2_CROP_DATA):
+            market.append(order)
+            continue
+        crop = str(order[1])
+        if day > int(_V2_CROP_DATA[crop]["latest"]):
+            continue
+        required = _v2_required_seed_stock(obs, state, route, action, crop)
+        missing = max(0, required - int(seeds.get(crop, 0)) - int(planned.get(crop, 0)))
+        quantity = min(max(0, int(order[2] or 0)), missing)
+        if quantity <= 0:
+            continue
+        order[2] = quantity
+        planned[crop] += quantity
+        market.append(order)
+    # Inject missing just-in-time seeds that the old early-buy schedule removed.
+    for crop in _V2_CROP_DATA:
+        if day > int(_V2_CROP_DATA[crop]["latest"]):
+            continue
+        required = _v2_required_seed_stock(obs, state, route, action, crop)
+        missing = max(0, required - int(seeds.get(crop, 0)) - int(planned.get(crop, 0)))
+        if missing > 0 and len(market) < 10:
+            market.append(["BUY_SEED", crop, missing])
+            planned[crop] += missing
+    action["market"] = market[:10]
+    return action
+
+
+def _v2_fib(index):
+    a, b = 1, 1
+    for _ in range(max(0, int(index))):
+        a, b = b, a + b
+    return a
+
+
+def _v2_order_cost(obs, order, market_inventory, hire_index, unlocked):
+    if not order:
+        return 0.0, hire_index, unlocked
+    op = str(order[0])
+    if op == "BUY_SEED" and len(order) >= 3:
+        crop = str(order[1])
+        return float(_V2_CROP_DATA.get(crop, {}).get("seed", 0)) * max(0, int(order[2] or 0)), hire_index, unlocked
+    if op == "BUY_ANIMAL" and len(order) >= 3:
+        animal = str(order[1])
+        return float(_V2_ANIMAL_DATA.get(animal, {}).get("cost", 0)) * max(0, int(order[2] or 0)), hire_index, unlocked
+    if op == "BUY_PRODUCT" and len(order) >= 3:
+        item = str(order[1])
+        quantity = max(0, int(order[2] or 0))
+        inventory = int(market_inventory.get(item, 10000))
+        cost = 0.0
+        for _ in range(quantity):
+            inventory -= 1
+            cost += _market_price(item, inventory)
+        market_inventory[item] = inventory
+        return cost, hire_index, unlocked
+    if op == "HIRE":
+        cost = float(_v2_fib(hire_index))
+        return cost, hire_index + 1, unlocked
+    if op == "BUY_LAND":
+        extra = max(0, unlocked - 1)
+        cost = float((1000, 2000, 4000)[extra]) if extra < 3 else float("inf")
+        return cost, hire_index, unlocked + 1
+    return 0.0, hire_index, unlocked
+
+
+def _v2_sell_revenue(item, quantity, market_inventory):
+    inventory = int(market_inventory.get(item, 10000))
+    revenue = 0.0
+    for _ in range(max(0, int(quantity))):
+        quote = _market_price(item, inventory)
+        revenue += quote
